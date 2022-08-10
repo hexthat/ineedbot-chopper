@@ -1,0 +1,2249 @@
+{
+  VarrockOakChopper
+  Author: ineedbot
+  Date: 09/16/2021
+
+  Modded on Date: 07/25/2022
+  by someone else
+
+  Version: 1.0.1
+
+  Make sure to setup the configuration below.
+
+  Script requires minimap orbs and XP counter to be visible at all times.
+  An uninterupted zoom level, GAME chat visible and the chat scrolled to the bottom.
+  As well as the camera pitch to remain at the highest at all times.
+
+  You can start anywhere as it will Webwalk to Draynor.
+  Make sure to have an axe (equipped or not) and a tinderbox if you plan on lighting fires.
+
+  Do note that lower combat levels will agro the wizards.
+  You can lose agro by being the area (without leaving) for about 10 minutes.
+  WARNING: Lighting fires will make your character leave the area! So you will reagro the wizards.
+}
+
+program VarrockChopper;
+{$DEFINE SRL_USE_REMOTEINPUT}
+{$I SRL/OSR.simba}
+
+type
+  TChopMode = (ChopDrop, ChopBank, ChopFire);
+
+const
+  DEBUGMODE      = True; // For debugging purposes
+  DRAWING        = False; // Draw stuff on the screen? Like proggies?
+  MSWALKING      = False; // Use mainscreen walking?
+  DOREPORTS      = True;  // Do proggies onto the console?
+  SHIFTDROP      = True;  // Use shift for dropping? WARNING False IS NOT YET IMPLEMENTED
+  USESPEC        = False; // Use the special attack when it can.
+  
+  TAKEBREAKS     = True;  // Take breaks?
+
+  // One of 'ChopDrop', 'ChopBank' or 'ChopFire'
+  // What should we do with the logs? Drop them? Bank them? Or light them?
+  CHOPMODE       = ChopBank;
+  
+  // Account details
+  _USERNAME       = 'thirsty.for.nympho@gmail.com';
+  _PASSWORD       = 'aYByucc7GgxMAh3';
+  _PIN            = '5622';
+  _WORLDS         = [369];
+  TOTALRUNTIME    = 160;  // How many minutes should we operate for?
+  
+
+  // Configuration complete!
+  // Below is script stuff
+
+  DROP_PATTERN_MKEYS: TIntegerArray = [0,1,5,4,8,9,13,12,16,17,21,20,24,25,
+                                       2,3,7,6,10,11,15,14,18,19,23,22,26,27];
+  
+type
+  TAntiBanEnergy = record
+    BioHash, Endurance, Patience: Double;
+  end;
+
+  TScript = record
+    Status, StopReason                                        : String;
+    Running, DidLogin, WalkedTreeForward                      : Boolean;
+    SleepRate, ChopWaitTime, LogsDone, BaseMouseSpeed,
+      HPPerc, ReportRate, DrawRate, WalkedTree, FireWaitTime,              
+      LastWalkedTree, FiredTile                               : Int32;
+    RSW                                                       : TRSWalker;
+    TinderItem                                                : TRSItem;
+    LogItems, ToolItems                                       : TRSItemArray;
+    TreeOptions, NoLightText                                  : TStringArray;
+    TreeTiles, BankTiles                                      : TPointArray;
+    TreeWalkTile, BankWalkTile                                : TPoint;
+    FireStartTiles: array of record
+      Tile                                                    : TPoint;
+      NumFires                                                : Int32;
+    end;
+    BankColor                                                 : TRSObjectFinder;
+    TreeColor: record
+      RSObject                                                : TRSObjectFinder;
+      FilterSize                                              : Int32;
+    end;
+    FireColor: record
+      RSObject                                                : TRSObjectFinder;
+      FilterSize                                              : Int32;
+    end;
+    Activity: record
+      XP                                                      : Int32;
+      Countdown                                               : TCountDown;
+    end;
+    ShutdownTime                                              : Int64;
+    TrueRunTime                                               : TStopwatch;
+    DrawCounter, ReportCounter                                : TCountdown;
+    AntiBan                                                   : TAntiban;
+    AntiBanEnergy                                             : TAntiBanEnergy;
+  end;
+  
+var
+  Bot: TScript;
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// OVERRIDES AND METHODS FOR FATIGUE
+// most of these come from Slacky!
+
+function EnergizedNumber(n: Double; Exp: Double = 0.2): Int64;
+begin
+  Result := Trunc(2*n * (1-Power(System.Max(0.0001, Bot.AntiBanEnergy.EnergyLevel(Bot.AntiBan)/100),Exp)));
+end;
+
+function BioRandomFixed(): Double;
+begin
+  Result := Bot.AntiBanEnergy.BioHash;
+end;
+
+function BioRandomCoinFlip(): Boolean;
+begin
+  Result := Random() > BioRandomFixed();
+end;
+
+function PerformanceTimer(): Double; override;
+begin
+  Result := GetTickCount();
+end;
+
+procedure WaitFatigue(t: Double);
+begin
+  System.Wait(EnergizedNumber(t));
+end;
+
+procedure Wait(min, max:Double; weight:EWaitDir=wdMean); override;
+var t: Double;
+begin
+  t := PerformanceTimer();
+  inherited(min, max, weight);
+  WaitFatigue(PerformanceTimer()-t);
+end;
+
+procedure WaitEx(mean, dev:Double); override;
+var t: Double;
+begin
+  t := PerformanceTimer();
+  inherited(mean, dev);
+  WaitFatigue(PerformanceTimer()-t);
+end;
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// METHODS FOR ENERGY ANTIBAN
+// most of these come from SRL/SRL repo!
+
+{
+  Sets up two variables Patience and an Endurance, based on your characters
+  nickname. These two factors are used within Energy calculation to make it
+  unique to you.
+
+  Patience (Energy gained from a break will..):
+    High:  Drop of more slowly, but drops harder near the end (2-4 hours, see Endurance).
+    Low:   Drop of faster, but gradually drop less of near the end.
+
+  Endurance:
+    - Energy from a break last 2-4 hours, depending on endurance (0..1).
+    High: You generally lasts longer before dropping off. Max endurance means
+          the bot can run for a full 24 hours before energy is depleted.
+    Low:  You generally drop off faster. Min endurance means the bot can
+          only run for 16 hours before energy is depleted.
+}
+procedure TAntiBanEnergy.SetupBiometrics();
+var
+  h,i:UInt32;
+  k: string;
+begin
+  k := Login.GetPlayer().User;
+  h := $811C9DC5;
+  for i:=1 to Length(k) do
+    h := (h * $1000193) xor Ord(k[i]);
+
+  Self.BioHash   := h / $FFFFFFFF;
+  Self.Endurance := Cos(Self.BioHash*PI/2);
+  Self.Patience  := Sin(Self.BioHash*PI/1);
+end;
+
+{
+  A 64bit timer for runtime, so that we can do long proggies without hickups
+}
+function TAntiban.TimeRunning(): Int64; constref;
+begin
+  Result := GetTimeRunning();
+end;
+
+{
+  Internally used to compute Energy
+  - It checks how long it was since last break, returns the value in milliseconds
+}
+function TAntiban.TimeSinceBreak(LongerThan:Double=0): UInt64;
+var i: Int32;
+begin
+  for i:=0 to High(Self.Breaks) do
+    if (Self.Breaks[i].Length >= LongerThan) and (Self.Breaks[i].PrevAtTime >= Result) then
+      Result := Trunc(Self.Breaks[i].PrevAtTime);
+  Result := Self.TimeRunning() - Result;
+end;
+
+{
+  Internally used to compute Energy
+  - The method gathers the sum/length of pauses the past `Timespan`.
+  It only counts one of each type of pauses, so if you have a 5 min break that
+  runs every 10 minutes, it will only count the last executed one no matter timespan.
+}
+function TAntiban.BreaksPast(Timespan: Double): Int64;
+var
+  XHoursAgo: Double := Self.TimeRunning() - Timespan;
+  active, started: Double;
+  i: Int32;
+begin
+  Active := Min(Timespan, Self.TimeRunning());
+  for i:=0 to High(Self.Breaks) do
+    if Self.Breaks[i].PrevAtTime >= XHoursAgo then
+    begin
+      if Self.Breaks[i].PrevAtTime = 0 then
+        Continue;
+      started := Max(XHoursAgo, Self.Breaks[i].PrevAtTime - Self.Breaks[i].Length);
+      Active -= Self.Breaks[i].PrevAtTime - started;
+    end;
+
+  Result := Round(Min(Timespan, Timespan - Active));
+end;
+
+{
+  Check if the antiban has a `sleep` break added.
+  Note: Sleep is defined by being 5+ hours, and is the the last added break.
+}
+function TAntiban.HasSleep(): Boolean;
+var zZz: Int32;
+begin
+  zZz := High(Self.Breaks);
+  Result := (zZz >= 0) and ((Self.Breaks[zZz].Length) > 5*ONE_HOUR);
+end;
+
+{
+  Returns the current energy of your character, based on recent breaks, and runtime.
+  You should start with near 100% energy, can be a little less.
+
+  This method does expect your bot to have a sleep break (5+ hours), otherwise it
+  wont be worth a lot.
+}
+function TAntiBanEnergy.EnergyLevel(AB: TAntiBan = Antiban): Double;
+var
+  zz: Int32;
+  t,eLeftFromSleep, eLeftFromBreak, eBreakValue: Double;
+  PastX: Double;
+begin
+  PastX := (2+(2*Self.Endurance)) * ONE_HOUR;
+  eLeftFromBreak := Max(0,Min(1,1-Power((AB.TimeSinceBreak() / (18*ONE_HOUR)), 1/3)));
+  eBreakValue    := Power(AB.BreaksPast(PastX) / (PastX), 1/3);
+  Result         := Max(0,Min(1,(eLeftFromBreak + eBreakValue) / (2.1 - (0.5*Self.Patience))));
+
+  if AB.HasSleep() then // if we have a sleep
+  begin
+    zz := High(AB.Breaks);
+    t := AB.TimeRunning() - Trunc(AB.Breaks[zz].PrevAtTime);
+    eLeftFromSleep := Max(0,Min(1,t / ((16*ONE_HOUR) + (8*ONE_HOUR*Self.Endurance))));
+    eLeftFromSleep := Power(1-eLeftFromSleep, 1/4);
+    Result := eLeftFromSleep * Result;
+  end;
+  Result := 100 * Result;
+end;
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// GENERAL ANTIBAN METHODS
+// most of these come from Flight!
+
+{
+  From Flight's AIOFisher
+}
+procedure TMouse.HumanMove(Point: TPoint);
+var
+  mPt: TPoint;
+  S: Int32;
+  Miss: Double;
+  Range: Int64;
+begin
+  S := Self.Speed;
+  Range := Trunc(Power(Self.Position().DistanceTo(Point), 0.80)); // how much possible range to miss
+  Miss := SRL.SkewedRand(0.9, 0.1, 1.5); // Where miss will happen. 1 = destination (P).
+
+  mPt.X := Trunc((1-Miss)*Self.Position().X + Miss*Point.X);
+  mPt.Y := Trunc((1-Miss)*Self.Position().Y + Miss*Point.Y);
+
+  mPt.X += SRL.NormalRange(-Range, Range);
+  mPt.Y += SRL.NormalRange(-Range, Range);
+
+  Self.Move(mPt);
+  Self.Speed := round(S*0.85);
+  Self.Move(Point);
+  Self.Speed := S;
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TMouse.RandomMovement();
+var
+  S: Int32;
+begin
+  S := Self.Speed;
+  Self.Speed := 4;
+  Self.Move(Box(Mouse.Position, 75, 75), True);
+  Self.Speed := S;
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TAntiBan.HoverMSTile(DotType: ERSMinimapDot; RightClick: Boolean = False);
+var
+  Tries,i: Int32;
+  a: Double;
+  rDot: TPoint;
+  msRect: TRectangle;
+  tpa,cTPA: TPointArray;
+  cArr: TIntegerArray;
+begin
+  tpa := Minimap.GetDots(DotType);
+  if tpa.Len() < 1 then Exit;
+  a := Minimap.GetCompassAngle(False);
+  repeat
+    inc(Tries);
+    rDot := tpa[random(low(tpa),high(tpa))];
+    msRect := Minimap.VecToMSRect(Vec3(rDot.X + 2, rDot.Y + 2, 0), a);
+    if MainScreen.Bounds.Contains(msRect) then
+    begin
+      Self.DebugLn('Hovering random ' + toStr(DotType));
+      // Get all colors on the tile
+      // Extract the rarest
+      // Gather points
+      // Mouse to random point
+      cArr := getColors(tpaFromBox(msRect.Bounds));
+      cArr.Sort();
+      cArr.ClearDuplicates();
+      for i:=0 to cArr.Len-1 do
+        if (SRL.FindColors(cTPA, CTS1(cArr[i], 10), msRect.Bounds) > 5) then
+        begin
+          Mouse.Move(cTPA.Mean());
+          if RightClick then
+            Mouse.Click(MOUSE_RIGHT);
+
+          wait(1500, 2700);
+          if RightClick then
+            ChooseOption.Close();
+          Exit;
+        end;
+    end;
+  until(Tries > 10);
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TAntiban.HoverMSItems();
+begin
+  Self.HoverMSTile(ERSMinimapDot.ITEM);
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TAntiban.HoverMSNPCs();
+begin
+  Self.HoverMSTile(ERSMinimapDot.NPC);
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TAntiban.HoverMSPlayers();
+begin
+  Self.HoverMSTile(ERSMinimapDot.PLAYER);
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TScript.DoLoseFocus();
+begin
+  Self.Antiban.LoseFocus(SRL.NormalRange(3700,5000));
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TScript.DoSkillHover();
+begin
+  Self.Antiban.HoverSkill(ERSSKILL.WOODCUTTING, random(1700, 3200), True)
+end;
+
+{
+  tries to read the xp bar, makes sure interfaces are not covering it
+}
+function TScript.ReadXPBar(): Int32;
+begin
+  // TODO check all interfaces?
+  if DepositBox.IsOpen() or Bank.IsOpen() or BankPin.IsOpen() then
+    Exit(-1);
+    
+  if not XPBar.Open() then
+    Exit(-1);
+    
+  Result := XPBar.Read();
+end;
+
+{
+  Checks to see failsafe xp gain
+  
+  Comes from olly/srl-development
+}
+function TScript.CheckActivity(): Boolean;
+var
+  XP: Int32;
+begin
+  XP := Self.ReadXPBar();
+  
+  if XP = -1 then
+    Exit();
+    
+  if XP <> Self.Activity.XP then
+  begin
+    Self.Activity.XP := XP;
+    Self.Activity.Countdown.Restart();
+    Result := True;
+  end
+  else if Self.Activity.Countdown.IsFinished() then
+    Self.Stop('No XP gain in 3 minutes');
+end;
+
+{
+  Enables special attack
+}
+procedure TScript.CheckSpec();
+begin
+  if not USESPEC then
+    Exit();
+    
+  if Minimap.GetOrbLevel(Minimap.GetSpecAttackCircle) >= 100 then
+  begin
+    Self.WriteMsg('Special attack boosting');
+    
+    Mouse.Click(Minimap.GetSpecAttackCircle(), MOUSE_LEFT);
+    
+    Wait(1000 + Random(1000));
+  end;
+end;
+
+{
+  Does general checks and does antiban.
+}
+function TScript.DoAntiBan(): Boolean;
+begin
+  // check if we need to end the script
+  if GetTimeRunning() > Self.ShutdownTime then
+    Self.Stop('Completed the runtime');
+    
+  // update our mousespeed, when we get tired, slow it down
+  Mouse.Speed := Self.BaseMouseSpeed - Round(5.0 * (Self.AntiBanEnergy.EnergyLevel(Self.Antiban) / 100));
+    
+  if not RSClient.IsLoggedIn() then
+    Exit();
+    
+  // are we under attack?
+  if Minimap.GetHPLevel() < Self.HPPerc then
+  begin
+    Self.HPPerc := Minimap.GetHPLevel();
+    
+    Self.SetStatus('Under attack! Going to bank!');
+    Self.WriteMsg('UNDER ATTACK! Going to the bank!');
+    
+    Self.GoToBank(True);
+    
+    if Self.HPPerc < 5 then
+      Self.Stop('Critical HP!')
+    else
+      Wait(5000, 15000);
+  end;
+  Self.HPPerc := Minimap.GetHPLevel();
+
+  // make sure nothing is selected in our inventory, might prevent us from interacting with stuff
+  Inventory.SetSelectedSlot(-1);
+  
+  // check we we leveled up
+  if Chat.LeveledUp() then
+  begin
+    Wait(0, 2500);
+    while Chat.ClickContinue() do
+      Wait(75, 500);
+  end;
+  
+  // check if we gained xp, failsafe
+  Self.CheckActivity();
+  
+  // TODO randomize
+  Self.CheckSpec();
+  
+  // TODO check for interfaces if opened... close em
+    
+  // general antiban
+  Result := Self.Antiban.DismissRandom() or Self.Antiban.DoAntiban();
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure PauseRunTime(Task: PBreakTask);
+var
+  T: PBreakTask;
+begin
+  Bot.TrueRunTime.Pause();
+  T := Task;
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure ResumeRunTime(Task: PBreakTask);
+var
+  T: PBreakTask;
+begin
+  if GetTimeRunning() > Bot.ShutdownTime then
+    Bot.Stop('Completed the runtime');
+
+  Bot.TrueRunTime.Resume();
+  T := Task;
+  Bot.Activity.Countdown.Restart();
+end;
+
+{
+  From Slacky's BarbFisher
+}
+procedure TScript.AfterActionAntiBan(DoAB: Boolean = True);
+begin
+  WaitEx(450,70);
+
+  if DoAB then
+    Self.DoAntiban();
+end;
+
+{
+  From Flight's AIOFisher
+}
+procedure TScript.AfterBankAntiBan(Percent: Double);
+var
+  randP: Double;
+begin
+  if Random() <= (Percent/100) then
+  begin
+    Self.Antiban.DebugLn('Bank screen antiban');
+    randP := Random();
+    if randP < 0.33 then
+      Mouse.RandomMovement()
+    else if (randP >= 0.33) and (randP < 0.66) then
+      wait(2800, 4000)
+    else if randP > 0.66 then
+    begin
+      // Copied version of 'random right click' antiban, minus the additional debug msg
+      Mouse.Move(GetClientBounds(), True, MOUSE_DISTRIBUTION_RANDOM);
+
+      if ChooseOption.Open() then
+      begin
+        if Random() < 0.50 then
+          Mouse.Move(ChooseOption.Bounds);
+
+        Wait(0, 8000, wdLeft);
+
+        ChooseOption.Close();
+      end;
+    end;
+
+  end;
+end;
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// GENERAL SCRIPT METHODS
+
+function TRSDepositBox.FindItems(Items: TRSItemArray; out Slots: TIntegerArray): Boolean;
+var
+  Item: TRSItem;
+begin
+  if not Self.IsOpen() then
+    Exit;
+
+  for Item in Items do
+    Slots += ItemFinder.Find(Item, Self.GetSlotBoxes());
+  
+  Result := Length(Slots) > 0;
+end;
+
+function TRSDepositBox.FindItems(Items: TRSItemArray): Boolean; overload;
+var
+  Slots: TIntegerArray;
+begin
+  Result := Self.FindItems(Items, Slots);
+end;
+
+function TRSDepositBox.GetSlotBox(Slot: Int32): TBox;
+begin
+  Result := Self.GetSlotBoxes()[Slot];
+end;
+
+function TRSDepositBox.IsSlotUsed(B: TBox): Boolean; overload;
+begin
+  Result := Inventory.IsSlotUsed(B);
+end;
+
+function TRSDepositBox.IsSlotUsed(Slot: Int32): Boolean; overload;
+begin
+  Result := Self.IsOpen() and Self.IsSlotUsed(Self.GetSlotBox(Slot));
+end;
+
+function TRSChooseOption.HasOption(Text: TStringArray; CaseSensitive: Boolean = True; CloseIfNotFound: Boolean = True): Boolean;
+var
+  Choices: TRSChooseOption_OptionArray;
+  I, J: Int32;
+begin
+  if Self.Open() then
+  begin
+    Wait(0, 1000, wdLeft);
+
+    Choices := GetOptions();
+
+    for I := 0 to High(Choices) do
+      for J := 0 to High(Text) do
+        if (CaseSensitive and (Text[J] in Choices[I].Text)) or ((not CaseSensitive) and (Lowercase(Text[J]) in Lowercase(Choices[I].Text))) then
+        begin
+          Exit(True);
+        end;
+
+    if CloseIfNotFound then
+    begin
+      WaitEx(500, 250);
+
+      Self.Close();
+    end;
+  end;
+end;
+
+function String.IsInString(A: TStringArray): Boolean;
+var
+  I: Int32;
+begin
+  for I := 0 to High(A) do
+      if (A[I] in Self) or (A[I] = Self) then
+        Exit(True);
+end;
+
+function TRSInventory.WaitChange(Count: Int32; WaitTime: Int32; Interval: Int32 = -1): Boolean;
+begin
+  if (Interval = -1) then
+    Interval := SRL.TruncatedGauss(50, 1500);
+
+  Result := WaitUntil(Self.Count() <> Count, Interval, WaitTime);
+end;
+
+{
+  Useful for while loops when need to clear an array
+}
+function TIntegerArray.Clear(): Boolean;
+begin
+  SetLength(Self, 0);
+  Exit(True);
+end;
+
+procedure TAntiBan.PauseAllTasks();
+var
+  I: Int32;
+begin
+  for I := 0 to High(Self.Tasks) do
+    Self.Tasks[I].Countdown.Pause();
+end;
+
+procedure TAntiBan.ResumeAllTasks();
+var
+  I: Int32;
+begin
+  for I := 0 to High(Self.Tasks) do
+    Self.Tasks[I].Countdown.Resume();
+end;
+
+{
+  Logs to the console.
+}
+procedure TScript.WriteMsg(Message: Variant; IsDebug: Boolean = False);
+begin
+  if not DEBUGMODE and IsDebug then
+    Exit();
+    
+  WriteLn(SRL.TimeStamp() + ':[Bot]: ' + ToStr(Message));
+  WriteLn('Ppos: ' + ToStr(Self.RSW.GetMyPos()) + #13#10);
+end;
+
+{
+  Sets the status of the script
+}
+procedure TScript.SetStatus(S: String);
+begin
+  if Self.Status = S then
+    Exit();
+
+  Self.Status := S;
+  
+  if DEBUGMODE then
+    Self.WriteMsg('[Debug]: ' + S);
+end;
+
+{
+  Ends the script.
+}
+procedure TScript.Stop(Reason: String = '');
+begin
+  Self.WriteMsg(Reason);
+  Self.SetStatus('Stopping... ' + Reason);
+  Self.StopReason := Reason;
+  Self.Running := False;
+end;
+
+{
+  Returns all the found trees
+}
+function TScript.FindTreeColor(Area: TBox): T2DPointArray;
+begin
+  Result := MainScreen.FindObject(Self.TreeColor.RSObject, Area);
+  Result.FilterSize(Self.TreeColor.FilterSize, __GT__);
+end;
+
+{
+  Returns all the found banks
+}
+function TScript.FindBankColor(Area: TBox): T2DPointArray;
+begin
+  Result := MainScreen.FindObject(Self.BankColor, Area);
+end;
+
+{
+  Returns all fires in the area
+}
+function TScript.FindFireColor(Area: TBox): T2DPointArray;
+begin
+  Result := MainScreen.FindObject(Self.FireColor.RSObject, Area);
+  Result.FilterSize(Self.FireColor.FilterSize, __GT__);
+end;
+
+{
+  Debug draws the stuff
+}
+procedure TScript.DebugDraw();
+var
+  ATPA: T2DPointArray;
+  TPA: TPointArray;
+  TreeTile, OurTile, BankTile, FireTile: TPoint;
+  TileRect: TRectangle;
+  i: Int32;
+begin
+  OurTile := Self.RSW.GetMyPos();
+  for TreeTile in Self.TreeTiles do
+  begin
+    TileRect := Self.RSW.GetTileMSEx(OurTile, TreeTile, 4);
+    
+    ATPA := Self.FindTreeColor(TileRect.Expand(Round(TileRect.Radius() * 1.15)).Bounds());
+    for TPA in ATPA do begin
+      RSClient.Image.DrawTPA(TPA, clRed);
+    end;
+    
+    RSClient.Image.DrawRect(TileRect, clBlue);
+  end;
+  
+  for BankTile in Self.BankTiles do
+  begin
+    TileRect := Self.RSW.GetTileMSEx(OurTile, BankTile, 4);
+    
+    ATPA := Self.FindBankColor(TileRect.Expand(Round(TileRect.Radius() * 1.15)).Bounds());
+    for TPA in ATPA do begin
+      RSClient.Image.DrawTPA(TPA, clOrange);
+    end;
+    
+    RSClient.Image.DrawRect(TileRect, clGreen);
+  end;
+  
+  for i:=Low(Self.FireStartTiles) to High(Self.FireStartTiles) do
+  begin
+    FireTile := Self.FireStartTiles[i].Tile;
+    
+    TileRect := Self.RSW.GetTileMSEx(OurTile, FireTile);
+    
+    ATPA := Self.FindFireColor(TileRect{.Expand(Round(TileRect.Radius() * 1.15))}.Bounds());
+    for TPA in ATPA do begin
+      RSClient.Image.DrawTPA(TPA, clOrange);
+    end;
+    
+    RSClient.Image.DrawRect(TileRect, clGreen);
+  end;
+end;
+
+{
+  Draws the stuff onto the screen
+}
+procedure TScript.Draw();
+begin
+  if not Self.DrawCounter.IsFinished() then
+    Exit();
+    
+  Self.DrawCounter.Restart();
+
+  RSClient.Image.Clear();
+  // TODO complete
+
+  if DEBUGMODE then
+    Self.DebugDraw();
+end;
+
+{
+  Does the proggy report to the console window
+}
+procedure TScript.ReportConsole();
+var
+  WriteOut, ChopType: String;
+begin
+  if not Self.ReportCounter.IsFinished() then
+    Exit();
+    
+  Self.ReportCounter.Restart();
+  
+  if CHOPMODE = ChopDrop then
+    ChopType := 'Chop and Drop'
+  else if CHOPMODE = ChopBank then
+    ChopType := 'Chop and Bank'
+  else 
+    ChopType := 'Chop and Light';
+  
+  WriteOut += 'Chopping type: ' + ChopType + #13#10;
+  WriteOut += 'Runtime: ' + SRL.MsToTime(Self.TrueRunTime.ElapsedTime(), Time_Short) + #13#10;
+  WriteOut += 'Status: ' + Self.Status + 'Ppos: ' + ToStr(Self.RSW.GetMyPos()) + #13#10;
+  WriteOut += 'Energy: ' + ToStr(Self.AntiBanEnergy.EnergyLevel(Self.Antiban)) + #13#10;
+  WriteOut += 'Chopped: ' + IntToStr(Self.LogsDone) + #13#10;
+  WriteOut += 'Taking long breaks: ' + ToStr(TAKEBREAKS) + #13#10;
+  WriteOut += 'Time until break: ' + Self.Antiban.TimeUntilBreak(Self.Antiban.Breaks[0]) + #13#10;
+  WriteOut += 'Time until shutdown: ' + SRL.MsToTime(Self.ShutdownTime - GetTimeRunning(), Time_Short) + #13#10;
+  
+  ClearDebug();
+  Writeln(WriteOut);
+end;
+
+{
+  General main loop stuff to do.
+}
+procedure TScript.DoMainLoopStuff(Status: String = ''; DoAB: Boolean = True);
+begin
+  if Status <> '' then
+    Self.SetStatus(Status);
+
+  if DoAB then
+    Self.DoAntiBan();
+    
+  if DOREPORTS then
+    Self.ReportConsole();
+
+  if DRAWING then
+    Self.Draw();
+    
+  Wait(Self.SleepRate);
+end;
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// GENERAL SCRIPT LOGIC
+
+{
+  Tries to find the tree at the tile, returns true if it does, also the area of where it is
+  
+  This is mainly from olly/srl-development woodcut test script
+}
+function TScript.FindTree(PlayerPos: TPoint; TreePos: TPoint; out Circle: TCircle): Boolean;
+var
+  Tile: TRectangle;
+  B: TBox;
+  TPA: TPointArray;
+begin
+  // get the tile location on the mainscreen, and check if its visible
+  Tile := Self.RSW.GetTileMSEx(PlayerPos, TreePos, 4);
+
+  B := Tile.Expand(Round(Tile.Radius() * 1.15)).Bounds();
+  B.LimitTo(MainScreen.Bounds());
+  if not MainScreen.IsVisible(B.Middle()) then
+    Exit();
+
+  // find the tree's colors in this tile
+  TPA := Self.FindTreeColor(B).Biggest();
+
+  if Length(TPA) > Self.TreeColor.FilterSize then
+  begin
+    Circle := TPA.MinAreaCircle();
+
+    // if the circle is larger than the tile's circle, this is good
+    Result := Circle.Radius >= Tile.ToTPA().MinAreaCircle().Radius;
+  end;
+end;
+
+{
+  Waits while we are chopping the tree
+}
+procedure TScript.WhileChopping(TreeTile: TPoint);
+var
+  TimeoutCounter: TCountdown;
+  OurPos: TPoint;
+  _: TCircle;
+  InvCount: Int32;
+begin
+  // wait for us to stop moving before we start monitoring the tree tile.
+  while RSClient.IsLoggedIn() and Minimap.HasFlag() and Minimap.IsPlayerMoving() do
+    Self.DoMainLoopStuff('Going to clicked tree...');
+
+  OurPos := Self.RSW.GetMyPos();
+  InvCount := Inventory.Count();
+  
+  // we timeout if we do not gain something into our inventory
+  TimeoutCounter.Init(Self.ChopWaitTime);
+  while not TimeoutCounter.IsFinished() do
+  begin
+    if not RSClient.IsLoggedIn() then
+    begin
+      Self.WriteMsg('WhileChopping: Not logged in', True);
+      break;
+    end;
+  
+    if not Self.FindTree(OurPos, TreeTile, _) then
+    begin
+      Self.WriteMsg('WhileChopping: Tree not found', True);
+      break;
+    end;
+      
+    if Inventory.IsFull() then
+    begin
+      Self.WriteMsg('WhileChopping: Inventory full', True);
+      break;
+    end;
+      
+    if Inventory.Count() > InvCount then
+    begin
+      Self.WriteMsg('WhileChopping: Got an item! Restarting timer', True);
+      TimeoutCounter.Restart();
+    end;
+  
+    InvCount := Inventory.Count();
+    Self.DoMainLoopStuff('Chopping tree...');
+  end;
+
+  if TimeoutCounter.IsFinished() then
+    Self.WriteMsg('WhileChopping: No log gained in timeout...', True);
+  
+  Self.SetStatus('Tree chopping completed!');
+end;
+
+{
+  Attempts to click on a tree, returns if it does
+}
+function TScript.ClickTree(): Boolean;
+var
+  OurPos, TreeTile: TPoint;
+  TreeCircle: TCircle;
+  TreeCircleRad: Int32;
+  TreeTiles: TPointArray;
+begin
+  OurPos := Self.RSW.GetMyPos();
+  TreeTiles := Copy(Self.TreeTiles);
+  TreeTiles.Sort(OurPos);
+  // TODO randomize
+  
+  Self.SetStatus('Finding trees...');
+  
+  // look at each tree to try click
+  for TreeTile in TreeTiles do
+  begin
+    if not Self.FindTree(OurPos, TreeTile, TreeCircle) then
+      continue;
+      
+    Self.SetStatus('Found tree! Checking uptext...');
+      
+    // lets mark that we are at this tree
+    // so lets remember the last tree we were at
+    // as well as remembering our current tree
+    Self.LastWalkedTree := Self.WalkedTree;
+    Self.WalkedTree := Self.TreeTiles.Find(TreeTile);
+    if Self.LastWalkedTree <> Self.WalkedTree then
+      Self.WalkedTreeForward := Self.LastWalkedTree < Self.WalkedTree;
+      
+    // ok, we found a tree at the tile, lets hover it and see if it is actually the tree
+    TreeCircleRad := Round(TreeCircle.Radius * 0.85);
+    Mouse.HumanMove(TreeCircle.Mean().Random(-TreeCircleRad, TreeCircleRad, True));
+    
+    if not MainScreen.IsUpText(Self.TreeOptions) then
+      continue;
+      
+    // tree! lets click it!
+    Self.SetStatus('Confirmed tree! Clicking tree...');
+      
+    if Random() < 0.20 then
+      Result := ChooseOption.Select(Self.TreeOptions)
+    else
+    begin
+      Mouse.Click(MOUSE_LEFT);
+
+      Result := MainScreen.DidRedClick();
+    end;
+    
+    if Result then
+    begin
+      // tree clicked! lets wait until we are done chopping
+      Self.SetStatus('Tree clicked!');
+      Self.AfterActionAntiBan(True);
+      Self.WhileChopping(TreeTile);
+      break;
+    end;
+  end;
+end;
+
+{
+  Walks to the trees
+}
+procedure TScript.GoToTrees(Force: Boolean = False);
+var
+  Where, OurPos: TPoint;
+  Walked: Boolean;
+begin
+  // tree traversal algorithm
+  // we will remember what tree we are currently at
+  // we will also remember what tree we were previously at
+  // using this info, we can determine which direction we are going
+  // through the list of trees.
+
+  // go to the 'next' tree
+  Self.SetStatus('Found no trees...');
+  OurPos := Self.RSW.GetMyPos();
+  Where := Self.TreeTiles[Self.WalkedTree];
+  if Force then
+    Where := Self.TreeWalkTile;
+  
+  if (OurPos.DistanceTo(Where) > 30) or
+    not MainScreen.IsVisible(Self.RSW.GetTileMSEx(OurPos, Where).Mean()) or
+    Force then
+  begin
+    Self.SetStatus('Going to trees...');
+    try
+      Walked := Self.RSW.WebWalk(Where.Random(-6, 6), 0, BioRandomFixed());
+    except
+    end;
+    
+    if not Walked then
+    begin
+      Self.WriteMsg('Failed to go to trees');
+      Exit();
+    end;
+  end;
+    
+  // set the 'next' tree...
+  if (Self.TreeTiles.Len() > 1) and not Force then
+  begin
+    if Self.WalkedTreeForward then
+    begin
+      Self.WalkedTree += 1;
+      if Self.WalkedTree > High(Self.TreeTiles) then
+      begin
+        Self.WalkedTree -= 2;
+        Self.WalkedTreeForward := False;
+      end;
+    end
+    else
+    begin
+      Self.WalkedTree -= 1;
+      if Self.WalkedTree < Low(Self.TreeTiles) then
+      begin
+        Self.WalkedTree += 2;
+        Self.WalkedTreeForward := True;
+      end;
+    end;
+  end;
+end;
+
+{
+  Drops all the logs in our inventory
+  
+  Part of this is from Flight's AIOFisher
+}
+procedure TScript.DropItems();
+var
+  R: Extended;
+  Pattern, LogSlots: TIntegerArray;
+  CurLogs: Int32;
+begin
+  Self.SetStatus('Dropping logs...');
+  
+  // query the logs
+  Inventory.FindItems(Self.LogItems, LogSlots);
+  CurLogs := LogSlots.Len();
+  Self.WriteMsg('DropItems: Log slots (before drop): ' + ToStr(LogSlots), True);
+  
+  // choose a random drop pattern
+  R := Random();
+  if R < 0.1 then
+    Pattern := Inventory.ErrorPattern(DROP_PATTERN_TOPDOWN, 5)
+  else if inRange(R, 0.1, 0.35) then
+    Pattern := Inventory.ErrorPattern(DROP_PATTERN_SNAKE, 5)
+  else
+    Pattern := Inventory.ErrorPattern(DROP_PATTERN_MKEYS, 5);
+    
+  // possibly not drop all logs, for antiban
+  if SRL.Dice(20) then
+    SetLength(Pattern, Random(Length(Pattern)));
+  if SRL.Dice(20) then
+    Pattern := Copy(Pattern, Random(Length(Pattern)));
+
+  // drop
+  if SHIFTDROP then
+    Inventory.ShiftDrop(Self.LogItems, Pattern);
+  // TODO do non shiftdropping
+    
+  // see how many logs we actually dropped, and log it
+  LogSlots.Clear();
+  Inventory.FindItems(Self.LogItems, LogSlots);
+  Self.LogsDone += CurLogs - LogSlots.Len();
+  Self.WriteMsg('DropItems: Log slots (after drop): ' + ToStr(LogSlots), True);
+  
+  Self.SetStatus('Logs dropped!');
+  Self.WriteMsg('Dropped logs... Currently chopped ' + IntToStr(Self.LogsDone) + ' logs!');
+end;
+
+{
+  Walks to the bank tiles
+}
+procedure TScript.GoToBank(Force: Boolean = False);
+var
+  Walked: Boolean;
+  OurPos: TPoint;
+begin
+  OurPos := Self.RSW.GetMyPos();
+  if (OurPos.DistanceTo(Self.BankWalkTile) > 30) or
+    not MainScreen.IsVisible(Self.RSW.GetTileMSEx(OurPos, Self.BankWalkTile).Mean()) or
+    Force then
+  begin
+    Self.SetStatus('Going to bank...');
+    try
+      Walked := Self.RSW.WebWalk(Self.BankWalkTile.Random(-4, 4), 0, BioRandomFixed());
+    except
+    end;
+    
+    if not Walked then
+    begin
+      Self.WriteMsg('Failed to go to bank!');
+      Exit();
+    end;
+  end;
+end;
+
+{
+  Returns true if it can see the bank
+}
+function TScript.FindBank(PlayerPos: TPoint; BankPos: TPoint; out Circle: TCircle): Boolean;
+var
+  Tile: TRectangle;
+  B: TBox;
+  TPA: TPointArray;
+begin
+  // find the bank's tile on the mainscreen
+  Tile := Self.RSW.GetTileMSEx(PlayerPos, BankPos, 4);
+
+  B := Tile.Expand(Round(Tile.Radius() * 1.15)).Bounds();
+  B.LimitTo(MainScreen.Bounds());
+  if not MainScreen.IsVisible(B.Middle()) then
+    Exit();
+
+  // check the bank's colors within the tile
+  TPA := Self.FindBankColor(B).Biggest();
+
+  // is it good? if so then return!
+  if Length(TPA) > 0 then
+  begin
+    Circle := TPA.MinAreaCircle();
+
+    Result := True;
+  end;
+end;
+
+{
+  Attempts to open the bank, returns true if it clicked on it.
+}
+function TScript.ClickBank(): Boolean;
+var
+  OurPos, BankTile: TPoint;
+  BankTiles: TPointArray;
+  BankCircle: TCircle;
+  BankCircleRad: Int32;
+begin
+  // bank might be already opened, lets return true
+  if Bank.IsOpen() or BankPin.IsOpen() or DepositBox.IsOpen() then
+    Exit(True);
+
+  OurPos := Self.RSW.GetMyPos();
+  BankTiles := Copy(Self.BankTiles);
+  BankTiles.Sort(OurPos);
+  // TODO randomize
+  
+  Self.SetStatus('Finding bank...');
+  
+  // search for every bank
+  for BankTile in BankTiles do
+  begin
+    // try see if we can find this bank
+    if not Self.FindBank(OurPos, BankTile, BankCircle) then
+      continue;
+      
+    Self.SetStatus('Found bank! Checking uptext...');
+    
+    // hover over the banktile and see if it is actually a bank
+    BankCircleRad := Round(BankCircle.Radius * 0.85);
+    Mouse.HumanMove(BankCircle.Mean().Random(-BankCircleRad, BankCircleRad, True));
+    
+    if not MainScreen.IsUpText(Bank.FINDER_UPTEXT) then
+      continue;
+      
+    Self.SetStatus('Confirmed bank! Opening bank...');
+      
+    // open the bank
+    if ('Banker' in MainScreen.GetUpText()) or (Random() < 0.20) then
+      Result := ChooseOption.Select(Bank.FINDER_OPTION)
+    else
+    begin
+      Mouse.Click(MOUSE_LEFT);
+
+      Result := MainScreen.DidRedClick();
+    end;
+    
+    if Result then
+    begin
+      Self.SetStatus('Bank clicked!');
+      Self.AfterActionAntiBan();
+      break;
+    end;
+  end;
+end;
+
+{
+  Waits for the bank to open, while doing so, it will input bankpin
+  Returns if the bank or depositbox was opened.
+}
+function TScript.WaitBankOpen(): Boolean;
+var
+  BankOpenCountDown: TCountdown;
+begin
+  // we only wait a finite amount of time...
+  BankOpenCountDown.Init(5000);
+  while not BankOpenCountDown.IsFinished() do
+  begin
+    if not RSClient.IsLoggedIn() then
+    begin
+      Self.WriteMsg('WaitBankOpen: Not logged in', True);
+      break;
+    end;
+    
+    // only countdown if we are not moving
+    if Minimap.HasFlag() and Minimap.IsPlayerMoving() then
+    begin
+      Self.WriteMsg('WaitBankOpen: Still moving...', True);
+      BankOpenCountDown.Restart();
+    end;
+      
+    // enter pin if needed
+    if BankPin.IsOpen() then
+    begin
+      Self.WriteMsg('WaitBankOpen: Entering pin...', True);
+      BankPin.Enter(Login.GetPlayer().Pin);
+      BankOpenCountDown.Restart();
+    end;
+    
+    if Bank.IsOpen(True) or DepositBox.IsOpen() then
+    begin
+      Self.WriteMsg('WaitBankOpen: Bank opened!', True);
+      Exit(True);
+    end;
+      
+    Self.DoMainLoopStuff('Going to clicked bank...', False);
+  end;
+
+  Self.WriteMsg('WaitBankOpen: Timed out...', True);
+  // bank didnt open... failed.
+end;
+
+{
+  Deposit our items into the depositbox or bank, which ever is open
+  
+  Part of this is from Flight's AIOFisher
+}
+procedure TScript.DepositItems();
+var
+  ToolSlots, LogSlots, Pattern: TIntegerArray;
+  CurLogs, i: Int32;
+  R: Extended;
+  IsBank: Boolean;
+begin
+  // we assume depositbox or bank is open at this point
+  IsBank := Bank.IsOpen();
+  Self.SetStatus('Depositing items...');
+  Self.AfterBankAntiBan(20);
+
+  // query the items in our inventory
+  if IsBank then
+  begin
+    Inventory.FindItems(Self.ToolItems, ToolSlots);
+    Inventory.FindItems(Self.LogItems, LogSlots);
+  end
+  else
+  begin
+    DepositBox.FindItems(Self.ToolItems, ToolSlots);
+    DepositBox.FindItems(Self.LogItems, LogSlots);
+  end;
+
+  Self.WriteMsg('DepositItems: ToolSlots: ' + ToStr(ToolSlots), True);
+  Self.WriteMsg('DepositItems: LogSlots: ' + ToStr(LogSlots), True);
+  
+  CurLogs := LogSlots.Len();
+  
+  // if we can deposit all our stuff
+  // TODO randomize
+  if ToolSlots.Len() <= 0 then
+  begin
+    if IsBank then
+      Bank.DepositAll()
+    else
+      DepositBox.GetButton(ERSDepositButton.DEPOSIT_INVENTORY).Click();
+  end
+  else
+  begin
+    // randomize the deposit pattern
+    R := Random();
+    if R < 0.1 then
+      Pattern := Inventory.ErrorPattern(DROP_PATTERN_TOPDOWN, 5)
+    else if inRange(R, 0.1, 0.35) then
+      Pattern := Inventory.ErrorPattern(DROP_PATTERN_SNAKE, 5)
+    else
+      Pattern := Inventory.ErrorPattern(DROP_PATTERN_MKEYS, 5);
+      
+    // randomly chop it off for extra antiban
+    if SRL.Dice(20) then
+      SetLength(Pattern, Random(Length(Pattern)));
+    if SRL.Dice(20) then
+      Pattern := Copy(Pattern, Random(Length(Pattern)));
+      
+    // make sure we do not deposit our tools
+    for i in ToolSlots do
+      Pattern.Remove(i);
+      
+    // deposit our stuff
+    for i in Pattern do
+    begin
+      if IsBank then
+      begin
+        if Inventory.IsSlotUsed(i) then
+        begin
+          // TODO randomize using deposit buttons
+          Bank.DepositSlot([i, BANK_DEPOSIT_ALL], False);
+          Wait(200, Random(550, 700));
+        end;
+      end
+      else
+      begin
+        if DepositBox.IsSlotUsed(i) then
+        begin
+          // TODO randomize using deposit buttons
+          Mouse.Move(DepositBox.GetSlotBox(i));
+          ChooseOption.Select('Deposit-All');
+        end;
+      end;
+    end;
+  end;
+  
+  // query how many logs we actually depositted
+  LogSlots.Clear();
+  
+  if IsBank then
+    Inventory.FindItems(Self.LogItems, LogSlots)
+  else
+    DepositBox.FindItems(Self.LogItems, LogSlots);
+  
+  // update how many logs we completed chopping
+  Self.LogsDone += CurLogs - LogSlots.Len();
+
+  Self.WriteMsg('DepositItems: LogItems (after bank): ' + ToStr(LogSlots), True);
+  
+  Self.SetStatus('Logs depositted!');
+  Self.WriteMsg('Banked logs... Currently chopped ' + IntToStr(Self.LogsDone) + ' logs!');
+  
+  Self.AfterBankAntiBan(30);
+  
+  // randomly close the bank
+  if Random() > 0.75 then
+  begin
+    if IsBank then
+      Bank.Close()
+    else
+      DepositBox.Close();
+  end;
+  
+  // fun fact: Inventory.IsFull will return false if it cannot open the gametab
+  // and when we are inside an interface, we cannot open the gametab
+  // so it returns false, but it is okay because we are actually not full
+end;
+
+{
+  Goes and banks our items
+  Will go to bank, open it, and deposit
+}
+procedure TScript.BankItems();
+var
+  ClickedBank: Boolean;
+begin
+  // try to click on the bank
+  ClickedBank := Self.ClickBank();
+  if not ClickedBank then
+  begin
+    // walk to the bank, and then try to open it
+    Self.GoToBank(True);
+    ClickedBank := Self.ClickBank();
+  end;
+    
+  // we clicked it, lets wait for it to open
+  if ClickedBank and Self.WaitBankOpen() then
+  begin
+    // it is now open! lets deposit
+    Self.DepositItems();
+    
+    // Lets go to the trees
+    Self.GoToTrees(True);
+  end;
+end;
+
+{
+  Waits for the fire to be created, when it is returns true
+}
+function TScript.WaitFireCreated(XP: Int32): Boolean;
+var
+  FireTimeout: TCountdown;
+  NowXP: Int32;
+begin
+  // init the stuff for waiting for the fire to be lit
+  Self.SetStatus('Waiting for the fire to be lit...');
+  FireTimeout.Init(Self.FireWaitTime);
+  while RSClient.IsLoggedIn() and not FireTimeout.IsFinished() do
+  begin
+    // check for level ups
+    if Chat.LeveledUp() then
+    begin
+      Self.WriteMsg('WaitFireCreated: Clicking level up', True);
+      while Chat.ClickContinue() do
+        Wait(75, 500);
+        
+      Wait(2000 + Random(1000));
+      Exit(True);
+    end;
+      
+    // did we gain xp? if so then the fire is lit!
+    NowXP := Self.ReadXPBar();
+    if NowXP = -1 then
+    begin
+      Self.WriteMsg('WaitFireCreated: Cannot read XP Bar.', True);
+      Exit(False);
+    end;
+
+    if NowXP <> XP then
+    begin
+      Self.WriteMsg('WaitFireCreated: XP changed! Lit!', True);
+      Exit(True);
+    end;
+    
+    Self.DoMainLoopStuff('', False);
+  end;
+
+  Self.WriteMsg('WaitFireCreated: Timed out...', True);
+end;
+
+{
+  Waits for the log to placed onto the ground
+}
+function TScript.WaitPlaceLog(InvCount: Int32): Boolean;
+var
+  S: String;
+  TinderBoxSlot: Int32;
+  InvCountTimeout: TCountdown;
+begin
+  Self.SetStatus('Waiting for the log to place...');
+  InvCountTimeout.Init(2000 + Random(500));
+  while RSClient.IsLoggedIn() and not InvCountTimeout.IsFinished() do
+  begin
+    // do we have a smaller bag?
+    // then the log must be on the ground
+    if Inventory.Count() < InvCount then
+    begin
+      Self.WriteMsg('WaitPlaceLog: Invcount lowered, log placed!', True);
+      Exit(True);
+    end;
+  
+    // check for the message if we cannot light a fire
+    // so make sure the GAME chat is visible and chat is scrolled to the bottom
+    S := Chat.GetMessage(7, [CHAT_COLOR_BLACK]);
+    if S.IsInString(Self.NoLightText) then
+    begin
+      Self.WriteMsg('WaitPlaceLog: Cannot light a fire here text', True);
+      // Push the GAME chat so it doesnt false positive next time
+      Inventory.FindItem(Self.TinderItem, TinderBoxSlot);
+      Mouse.Move(Inventory.GetSlotBox(TinderBoxSlot));
+      ChooseOption.Select('Examine');
+      Exit(False);
+    end;
+      
+    Self.DoMainLoopStuff('', False);
+  end;
+
+  Self.WriteMsg('WaitPlaceLog: Timed out...', True);
+end;
+
+{
+  Does a fire chain until it can't
+}
+function TScript.LightLogs(NumLights: Int32 = 27): Boolean;
+var
+  TinderBoxSlot, i, XP, CurLogs, CurSelectedItem, CurHoveredItem, Idx, NextLog,
+    CurInvCount: Int32;
+  LogSlots, Pattern: TIntegerArray;
+  R: Extended;
+  //CurPos, Pos: TPoint;
+begin
+  // make sure we have logs and a tinderbox
+  if not Inventory.FindItem(Self.TinderItem, TinderBoxSlot) then
+  begin
+    Self.WriteMsg('LightLogs: No tinder box.', True);
+    Exit();
+  end;
+    
+  if not Inventory.FindItems(Self.LogItems, LogSlots) then
+  begin
+    Self.WriteMsg('LightLogs: No logs.', True);
+    Exit();
+  end;
+    
+  // make sure we can see the xp counter
+  XP := Self.ReadXPBar();
+  if XP = -1 then
+  begin
+    Self.WriteMsg('LightLogs: Cannot see XP bar.', True);
+    Exit();
+  end;
+
+  Self.WriteMsg('LightLogs: Tinderbox: ' + ToStr(TinderBoxSlot), True);
+  Self.WriteMsg('LightLogs: LogSlots: ' + ToStr(LogSlots), True);
+    
+  // randomize the pattern
+  R := Random();
+  if R < 0.1 then
+    Pattern := Inventory.ErrorPattern(DROP_PATTERN_TOPDOWN, 5)
+  else if inRange(R, 0.1, 0.35) then
+    Pattern := Inventory.ErrorPattern(DROP_PATTERN_SNAKE, 5)
+  else
+    Pattern := Inventory.ErrorPattern(DROP_PATTERN_MKEYS, 5);
+    
+  // randomly chop it off for extra antiban
+  {if SRL.Dice(20) then
+    SetLength(Pattern, Random(Length(Pattern)));
+  if SRL.Dice(20) then
+    Pattern := Copy(Pattern, Random(Length(Pattern)));}
+    
+  // remove all slots that are not a log
+  for i:=High(Pattern) downto Low(Pattern) do
+    if LogSlots.Find(i) = -1 then
+      Pattern.Remove(i);
+      
+  // trim to the limit param
+  if Pattern.Len() > NumLights then
+    SetLength(Pattern, NumLights);
+  
+  // start lighting the logs
+  CurLogs := LogSlots.Len();
+  // CurPos := Self.RSW.GetMyPos();
+  
+  for Idx:=Low(Pattern) to High(Pattern) do
+  begin
+    i := Pattern[Idx];
+    
+    if not RSClient.IsLoggedIn() then
+      break;
+      
+    // check if we moved right
+    // sometimes inaccurate or unreliable
+    // using the NumLights is enough
+    {Pos := Self.RSW.GetMyPos();
+    if Pos.X - 1 > CurPos.X + 2 then
+      break; // then the fire chain must be maxxed.
+    CurPos := Pos;}
+      
+    CurSelectedItem := Inventory.GetSelectedSlot();
+    CurHoveredItem := Inventory.PointToSlot(Mouse.Position());
+    CurInvCount := Inventory.Count();
+    XP := Self.ReadXPBar();
+    Self.SetStatus('Lighting the fire...');
+    
+    // Start lighting the fire...
+    // are we hovering over a log?
+    // TODO randomize
+    if i = CurHoveredItem then
+    begin
+      // is the selected item a tinderbox?
+      if CurSelectedItem = TinderBoxSlot then
+        Mouse.Click(MOUSE_LEFT) // then click and start the fire.
+      else
+      begin
+        // we need to select this slot then
+        Inventory.SetSelectedSlot(CurHoveredItem);
+        
+        // start the fire now!
+        Mouse.Click(Inventory.GetSlotBox(TinderBoxSlot), MOUSE_LEFT);
+      end;
+    end
+    // are we hovering over the tinderbox?
+    else if CurHoveredItem = TinderBoxSlot then
+    begin
+      // is the selected item a log?
+      if CurSelectedItem = i then
+        Mouse.Click(MOUSE_LEFT) // click and start the fire
+      else
+      begin
+        // we need to select this slot then...
+        Inventory.SetSelectedSlot(TinderBoxSlot);
+        
+        // start the fire
+        Mouse.Click(Inventory.GetSlotBox(i), MOUSE_LEFT);
+      end;
+    end
+    else
+    begin
+      // is the selection a log?
+      if CurSelectedItem = i then
+        Mouse.Click(Inventory.GetSlotBox(TinderBoxSlot), MOUSE_LEFT)
+      // is it the tinder?
+      else if CurSelectedItem = TinderBoxSlot then
+        Mouse.Click(Inventory.GetSlotBox(i), MOUSE_LEFT)
+      else
+      begin
+        if Random() > 0.5 then
+        begin
+          Inventory.SetSelectedSlot(i);
+          Mouse.Click(Inventory.GetSlotBox(TinderBoxSlot), MOUSE_LEFT);
+        end
+        else
+        begin
+          Inventory.SetSelectedSlot(TinderBoxSlot);
+          Mouse.Click(Inventory.GetSlotBox(i), MOUSE_LEFT);
+        end;
+      end;
+    end;
+    
+    // wait for the log to be placed
+    if not Self.WaitPlaceLog(CurInvCount) then
+      break;
+    
+    // fires should be starting... lets prepare for next action if needed
+    // TODO randomize
+    if Idx < High(Pattern) then
+    begin
+      CurHoveredItem := Inventory.PointToSlot(Mouse.Position());
+      NextLog := Pattern[Idx + 1];
+      
+      // Check if select tinderbox and hover over next log
+      if CurHoveredItem = TinderBoxSlot then
+      begin
+        // select tinder, hover next log
+        Inventory.SetSelectedSlot(TinderBoxSlot);
+        Mouse.Move(Inventory.GetSlotBox(NextLog));
+      end
+      else
+      begin
+        // select nextlog, hover tinder
+        Inventory.SetSelectedSlot(NextLog);
+        Mouse.Move(Inventory.GetSlotBox(TinderBoxSlot));
+      end;
+    end;
+    
+    // wait for the fire to be created
+    if not Self.WaitFireCreated(XP) then
+      break;
+  end;
+  
+  if RSClient.IsLoggedIn() then
+  begin
+    // return if we completed the entire fire chain
+    Result := (Idx > High(Pattern));
+  
+    // count how many logs we burnt
+    LogSlots.Clear();
+    Inventory.FindItems(Self.LogItems, LogSlots);
+    // update how many logs we completed chopping
+    Self.LogsDone += CurLogs - LogSlots.Len();
+
+    Self.WriteMsg('LightLogs: LogSlots(after): ' + ToStr(LogSlots), True);
+  end;
+  
+  Self.WriteMsg('Logs lit... Currently chopped ' + IntToStr(Self.LogsDone) + ' logs!');
+end;
+
+{
+  Tries to find a fire at the location
+}
+function TScript.FindFire(PlayerPos: TPoint; FirePos: TPoint; out Circle: TCircle): Boolean;
+var
+  Tile: TRectangle;
+  B: TBox;
+  TPA: TPointArray;
+begin
+  // get the tile location on the mainscreen, and check if its visible
+  Tile := Self.RSW.GetTileMSEx(PlayerPos, FirePos);
+
+  B := Tile{.Expand(Round(Tile.Radius() * 1.15))}.Bounds();
+  B.LimitTo(MainScreen.Bounds());
+  if not MainScreen.IsVisible(B.Middle()) then
+    Exit();
+
+  // find the tree's colors in this tile
+  TPA := Self.FindFireColor(B).Biggest();
+
+  if Length(TPA) > Self.FireColor.FilterSize then
+  begin
+    Circle := TPA.MinAreaCircle();
+
+    // make sure the middle of the tile is inside!
+    Result := Tile.Contains(TPA.Mean());
+  end;
+end;
+
+{
+  Goes to the fire tile.
+  Returns true if we are on the tile exactly
+}
+function TScript.GoToFireStart(Force: Boolean = False): Boolean;
+var
+  OurPos, FirePos: TPoint;
+  Timeout: TCountdown;
+  Walked, DidMSClick: Boolean;
+  TileRect: TRectangle;
+  _: TCircle;
+begin
+  // Minimap.SetCompassAngle(0);
+  OurPos := Self.RSW.GetMyPos();
+  FirePos := Self.FireStartTiles[Self.FiredTile].Tile;
+  
+  if Self.FindFire(OurPos, FirePos, _) then
+  begin
+    Self.WriteMsg('GoToFireStart: Found a fire at the start tile.', True);
+    Exit();
+  end;
+  
+  // Go to the starting fire tile
+  if (OurPos.DistanceTo(FirePos) >= 32) or
+    not MainScreen.IsVisible(Self.RSW.GetTileMSEx(OurPos, FirePos).Mean()) or
+    Force then
+  begin
+    Self.SetStatus('Walking to starting fire tile...');
+    try
+      Walked := Self.RSW.WebWalk(FirePos + Point(-4, 0), 0, BioRandomFixed());
+    except
+    end;
+    
+    if not Walked then
+    begin
+      Self.WriteMsg('Failed to walk to fire pos');
+      Exit();
+    end;
+  end;
+
+  OurPos := Self.RSW.GetMyPos();
+  if Self.FindFire(OurPos, FirePos, _) then
+  begin
+    Self.WriteMsg('GoToFireStart: Found a fire at the start tile.', True);
+    Exit();
+  end;
+    
+  // make sure that we are on the tile..
+  Timeout.Init(15000);
+  while RSClient.IsLoggedIn() and not Timeout.IsFinished() do
+  begin
+    OurPos := Self.RSW.GetMyPos();
+    if OurPos.DistanceTo(FirePos) >= 3 then
+    begin
+      Self.SetStatus('Going on top of the fire starting tile...');
+      
+      // TODO randomize
+      if DidMSClick then
+        // use MM, it is more accurate!
+        Mouse.Click(Self.RSW.WorldToMM(OurPos, FirePos, Minimap.GetCompassAngle(False)), MOUSE_LEFT)
+      else
+      begin
+        // try mainscreen, it maybe inaccurate
+        DidMSClick := True;
+        
+        TileRect := Self.RSW.GetTileMSEx(OurPos, FirePos);
+        
+        if not MainScreen.IsVisible(TileRect.Mean()) then
+          continue;
+        
+        Mouse.Move(TileRect);
+        
+        // check if a fire exists here
+        if MainScreen.IsUpText('options') and ChooseOption.HasOption(['Fire']) then
+          break;
+        
+        if MainScreen.IsUpText('Walk here') then
+          Mouse.Click(MOUSE_LEFT)
+        else
+          ChooseOption.Select('Walk here');
+      end;
+      
+      Minimap.WaitFlag();
+      Minimap.WaitPlayerMoving();
+    end
+    else
+    begin
+      Result := True;
+      break;
+    end;
+  end;
+end;
+
+{
+  Start burning the logs to get rid of them
+}
+function TScript.TryFireItems(): Boolean;
+begin
+  // make sure we have logs and a tinderbox
+  if not Inventory.FindItem(Self.TinderItem) or not Inventory.FindItems(Self.LogItems) then
+    Exit(True);
+  
+  // try go to the fire
+  if not Self.GoToFireStart() then
+    Exit();
+    
+  // pause antiban so tasks won't 100% run once we are done
+  Self.Antiban.PauseAllTasks();
+    
+  // start the fire chain
+  // if a fire chain does not complete successfully, we go to the next one...
+  Result := Self.LightLogs(Self.FireStartTiles[Self.FiredTile].NumFires);
+  
+  // resume the antiban tasks
+  Self.Antiban.ResumeAllTasks();
+end;
+
+{
+  Will try to light logs on fire
+}
+procedure TScript.FireItems();
+var
+  OurPos, FirePos: TPoint;
+begin
+  while RSClient.IsLoggedIn() do
+  begin
+    if not Self.TryFireItems() then
+    begin
+      Self.SetStatus('Trying a different fire lane...');
+      Self.WriteMsg('Trying a different fire lane...');
+    
+      Self.FiredTile += 1;
+      if Self.FiredTile > High(Self.FireStartTiles) then
+        Self.FiredTile := Low(Self.FireStartTiles);
+      if Self.FiredTile < Low(Self.FireStartTiles) then
+        Self.FiredTile := High(Self.FireStartTiles);
+    end;
+    
+    // check if we still have logs
+    if Inventory.FindItem(Self.TinderItem) and Inventory.FindItems(Self.LogItems) then
+    begin
+      // check if we are closer to the firetile than the trees
+      OurPos := Self.RSW.GetMyPos();
+      FirePos := Self.FireStartTiles[Self.FiredTile].Tile;
+      // lets keep lighting fires as its closer
+      if OurPos.DistanceTo(FirePos) < OurPos.DistanceTo(Self.TreeTiles.Mean()) then
+      begin
+        Self.SetStatus('We still have logs and trees are far, lets keep lighting...');
+        continue;
+      end
+      else
+        break;
+    end
+    else
+      break;
+  end;
+end;
+
+{
+  Executes when we should do something about our full inventory
+}
+procedure TScript.DoFullInventory();
+begin
+  if CHOPMODE = ChopDrop then
+    Self.DropItems()
+  else if CHOPMODE = ChopBank then
+    Self.BankItems()
+  else
+    Self.FireItems();
+    
+  Self.AfterActionAntiBan(True);
+end;
+
+{
+  Executes when we need to gather items to fill our inventory
+}
+procedure TScript.DoGathering();
+begin
+  if not Self.ClickTree() then
+    Self.GoToTrees();
+    
+  Self.AfterActionAntiBan(True);
+end;
+
+{
+  Main loop of the script.
+}
+procedure TScript.Run();
+begin
+  while Self.Running do
+  begin
+    if RSClient.IsLoggedIn() then
+    begin
+      // TODO randomize
+      if Inventory.IsFull() then
+        Self.DoFullInventory()
+      else
+        Self.DoGathering();
+    end
+    else
+    begin
+      if Login.LoginPlayer() then
+        Self.OnLogin();
+    end;
+    Self.DoMainLoopStuff();
+  end;
+  
+  Logout.ClickLogout();
+  Self.WriteMsg('Stop reason: ' + Self.StopReason);
+  TerminateScript('Time to shutdown');
+end;
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// SETUP AND INIT STUFF
+
+{
+  When the player logs in.
+}
+procedure TScript.OnLogin();
+begin
+  // is this the first login?
+  if not Self.DidLogin then
+  begin
+    Self.DidLogin := True;
+      
+    MM2MS.ZoomLevel         := Options.GetZoomLevel();
+  end;
+  
+  Self.HPPerc             := Minimap.GetHPLevel();
+  MainScreen.SetHighestPitch();
+  Self.Activity.Countdown.Restart();
+  minimap.SetCompassAngle(Random(170, 190));
+end;
+
+{
+  Frees the stuff when script completes
+}
+procedure TScript.Free();
+begin
+end;
+
+{
+  Inits the script...
+}
+procedure TScript.Init();
+var
+  Worlds: TIntegerArray;
+begin
+  // init the player
+  if _WORLDS[0] <> -1 then
+    Worlds := _WORLDS;
+
+  Login.AddPlayer(_USERNAME, _PASSWORD, _PIN, Worlds);
+  Self.AntiBanEnergy.SetupBiometrics();
+  Self.AntiBan.Name := 'Antiban';
+
+  Self.Running := True;
+  Self.SleepRate := 75;
+  Self.DrawRate := 2500;
+  Self.ReportRate := 2500;
+  Self.Activity.Countdown.Init(180000);
+  
+  //Self.RSW.Setup('world');
+  Self.RSW.Setup('zeah');
+  
+  Self.ShutdownTime := (TOTALRUNTIME * 60000) + Random(- (TOTALRUNTIME * 6000), (TOTALRUNTIME * 6000));
+  
+  Mouse.Speed             := 15 + Round(BioRandomFixed() * 10) + Random(-2, 2);
+  Self.BaseMouseSpeed := Mouse.Speed;
+  Mouse.Distribution      := MOUSE_DISTRIBUTION_GAUSS;
+  ItemFinder.Similarity   := 0.99;
+  
+  Self.RSW.ScreenWalk     := MSWALKING;
+  
+  // init the antiban stuff
+  Self.Antiban.OnStartBreak    := @PauseRunTime;
+  Self.Antiban.OnFinishBreak   := @ResumeRunTime;
+  
+  Self.Antiban.AddTask(ONE_SECOND*40, @Mouse.RandomMovement);
+  //Self.Antiban.AddTask(ONE_MINUTE*2,  @Antiban.RandomRotate);
+  Self.Antiban.AddTask(ONE_MINUTE*3,  @Self.DoLoseFocus);
+  Self.Antiban.AddTask(ONE_MINUTE*4,  @Antiban.HoverMSItems);
+  Self.Antiban.AddTask(ONE_MINUTE*4,  @Antiban.HoverMSNPCs);
+  Self.Antiban.AddTask(ONE_MINUTE*6,  @Antiban.HoverMSPlayers);
+  Self.Antiban.AddTask(ONE_MINUTE*8,  @Self.DoSkillHover);
+  Self.Antiban.AddTask(ONE_MINUTE*11,  @Antiban.RandomTab);
+  Self.Antiban.AddBreak(ONE_MINUTE*18, ONE_SECOND*25, 0.2, 0.0);
+  
+  if TAKEBREAKS then
+  begin
+    Self.Antiban.AddBreak(ONE_MINUTE*45, ONE_MINUTE*2, 0.2, 1.0);
+    Self.Antiban.AddBreak(ONE_HOUR*2, ONE_MINUTE*5, 0.2, 1.0);
+    Self.Antiban.AddBreak(ONE_HOUR*4, ONE_MINUTE*15, 0.2, 1.0);
+    Self.Antiban.AddBreak(ONE_HOUR*17, ONE_HOUR*3, 0.2, 1.0);
+  end;
+  
+  // location specific stuff
+
+  // Tree vally
+  //Self.TreeWalkTile := Point(4434, 2620);
+  //Self.FireStartTiles := [[Point(4571, 2627), 19], [Point(4555, 2589), 28]];
+  //Self.TreeTiles := [Point(4416, 2590), Point(4414, 2604), Point(4430, 2600), Point(4427, 2618), Point(4408, 2618), Point(4424, 2627), Point(4430, 2627), Point(4439, 2627), Point(4450, 2612)];
+
+  // East Varrock
+  //Self.TreeWalkTile := Point(4933, 2735);
+  //Self.FireStartTiles := [[Point(4990, 2735), 28], [Point(4990, 2731), 28]];
+  //Self.TreeTiles := [Point(4938, 2745), Point(4929, 2724)];
+
+  //Lumby(ORS walking broken,have to update world.graph)
+  //Self.TreeWalkTile := Point(4720, 3477);
+  //Self.TreeTiles := [Point(4749, 3494), Point(4743, 3468)];
+  //Self.FireStartTiles := [[Point(4738, 3455), 18], [Point(4738, 3460), 18], [Point(4712, 3451), 12]];
+
+  //Dray
+  //Self.FireStartTiles := [[Point(4216, 3492), 23], [Point(4216, 3496), 18],
+    //[Point(4216, 3500), 18], [Point(4252, 3508), 22], [Point(4274, 3512), 27]];
+  //Self.TreeTiles := [Point(4144, 3498), Point(4152, 3504), Point(4164, 3508),
+    //Point(4158, 3520), Point(4162, 3536)];
+  //Self.TreeWalkTile := Point(4148, 3496);
+
+  // Cow Willows
+  //Self.FireStartTiles := [[Point(4781, 3219), 24], [Point(4738, 3223), 11], [Point(4729, 3219), 19]];
+  //Self.TreeTiles := [Point(4693, 3214), Point(4693, 3224), Point(4697, 3242)];
+  //Self.TreeWalkTile := Point(4709, 3228);
+
+  //Edge Yew
+  //Self.FireStartTiles := [[Point(4162, 2523), 28]];
+  //Self.TreeTiles := [Point(4155, 2571), Point(4155, 2526)];
+  //Self.TreeWalkTile := Point(4162, 2560);
+
+  //Rim Yew
+  //Self.FireStartTiles := [[Point(3581, 3536), 25], [Point(3586, 3552), 15]];
+  //Self.TreeTiles := [Point(3550, 3543), Point(3547, 3516), Point(3575, 3516), Point(3557, 3527)];
+  //Self.TreeWalkTile := Point(3561, 3520);
+
+  //fally Yew
+  //Self.FireStartTiles := [[Point(3581, 3536), 25], [Point(3586, 3552), 15]];
+  //Self.TreeTiles := [Point(3886, 3183), Point(3802, 3199)];
+  //Self.TreeWalkTile := Point(3838, 3183);
+
+  //Oak West Varrock
+  //Self.FireStartTiles := [[Point(4574, 2735), 27], [Point(4574, 2731), 27], [Point(4574, 2728), 27]];
+  //Self.TreeTiles := [Point(4460, 2777), Point(4484, 2762)];
+  //Self.TreeWalkTile := Point(4470, 2771);
+
+  //Magic WC
+  Self.TreeTiles := [Point(1714, 2520), Point(1714, 2526), Point(1702, 2520), Point(1702, 2526)];
+  Self.TreeWalkTile := Point(1714, 2523);
+
+  //Magic Hosidius
+  //Self.TreeTiles := [Point(2410, 2195), Point(2394, 2195)];
+  //Self.TreeWalkTile := Point(2402, 2195);
+
+  //Yew WC
+  //Self.FireStartTiles := [[Point(1983, 2434), 28], [Point(1983, 2437), 28]];
+  //Self.TreeTiles := [Point(1921, 2427), Point(1901, 2427), Point(1885, 2411), Point(1910, 2395)];
+  //Self.TreeWalkTile := Point(1905, 2427);
+
+  //Maple WC
+  //Self.FireStartTiles := [[Point(1837, 2470), 27]];
+  //Self.TreeTiles := [Point(1845, 2473), Point(1834, 2485), Point(1842, 2502), Point(1854, 2489), Point(1874, 2486), Point(1865, 2473)];
+  //Self.TreeWalkTile := Point(1846, 2483);
+
+  // tree types
+  // Tree
+  //Self.TreeOptions := ['Chop down Tree', 'Chop', 'down', 'Tree'];
+  //Self.LogItems := ['Logs'];
+
+  // oak
+  //Self.TreeOptions := ['Chop down Oak', 'Chop', 'down', 'Oak'];
+  //Self.LogItems := ['Oak logs'];
+
+  // willow
+  //Self.TreeOptions := ['Chop down Willow', 'Chop', 'down', 'Willow'];
+  //Self.LogItems := ['Willow logs'];
+
+  // maple
+  //Self.TreeOptions := ['Chop down Maple', 'Chop', 'down', 'Maple'];
+  //Self.LogItems := ['Maple logs'];
+
+  // yew
+  //Self.TreeOptions := ['Chop down Yew', 'Chop', 'down', 'Yew'];
+  //Self.LogItems := ['Yew logs'];
+
+  // Magic
+  Self.TreeOptions := ['Chop down Magic', 'Chop', 'down', 'Magic'];
+  Self.LogItems := ['Magic logs'];
+
+  Self.TinderItem := 'Tinderbox';
+  Self.NoLightText := ['You can''t light a fire here.'];
+  Self.ToolItems := [Self.TinderItem, 'Rune axe', 'Dragon axe', 'Bronze axe',
+    'Iron axe', 'Steel axe', 'Black axe', 'Mithril axe', 'Adamant axe',
+    'Gilded axe', '3rd age axe', 'Infernal axe', 'Crystal axe'];
+  Self.ChopWaitTime := 60000;
+  Self.FireWaitTime := 10000;
+  with Self.TreeColor do
+  begin
+    // magic
+    RSObject.Colors += CTS2(5537158, 3, 0.05, 1.08);
+    RSObject.Colors += CTS2(11656158, 2, 0.19, 7.62);
+    RSObject.Colors += CTS2(15398133, 4, 0.07, 0.85);
+    RSObject.Colors += CTS2(1649705, 2, 1.04, 5.68);  // dark side
+    // tree and oak and Yew
+    //RSObject.Colors += CTS2(3312508, 3, 0.05, 1.08);
+    //RSObject.Colors += CTS2(1593670, 2, 0.19, 7.62);
+    //RSObject.Colors += CTS2(5413260, 4, 0.07, 0.85);
+    //RSObject.Colors += CTS2(2049086, 2, 1.04, 5.68);  // dark side
+    // willow
+    //RSObject.Colors += CTS2(3763042, 3, 0.05, 1.08);
+    //RSObject.Colors += CTS2(3306343, 2, 0.19, 7.62);
+    //RSObject.Colors += CTS2(3713943, 4, 0.07, 0.85);
+    //RSObject.Colors += CTS2(462606, 2, 1.04, 5.68);  // dark side
+    // maple
+    //RSObject.Colors += CTS2(26001, 3, 0.05, 1.08);
+    //RSObject.Colors += CTS2(12121, 2, 0.19, 7.62);
+    //RSObject.Colors += CTS2(3696259, 4, 0.07, 0.85);
+    //RSObject.Colors += CTS2(7980, 2, 1.04, 5.68);  // dark side
+
+    RSObject.Grow := 10;
+    RSObject.Erode := 5;
+    RSObject.ClusterDistance := 3;
+    FilterSize := 30;
+  end;
+  // West Varrock tree
+  //Self.BankTiles := [Point(4552, 2678), Point(4552, 2671)];
+  //Self.BankWalkTile := Point(4549, 2672);
+  //Self.BankColor.Colors += CTS2(3892081, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(5131859, 2, 0.07, 1.23);
+  // West Varrock Oak
+  //Self.BankTiles := [Point(4552, 2704)];
+  //Self.BankWalkTile := Point(4542, 2708);
+  //Self.BankColor.Colors += CTS2(3892852, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(5131859, 2, 0.07, 1.23);
+  // East Varrock
+  //Self.BankTiles := [Point(4825, 2770), Point(4821, 2770)];
+  //Self.BankWalkTile := Point(4825, 2764);
+  //Self.BankColor.Colors += CTS2(4354688, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(3496293, 2, 0.07, 1.23);
+  // dray
+  //Self.BankTiles := [Point(4174, 3468)];
+  //Self.BankWalkTile := Point(4178, 3468);
+  //Self.BankColor.Colors += CTS2(6251626, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(1069415, 2, 0.07, 1.23);
+  // Edge
+  //Self.BankTiles := [Point(4190, 2483)];
+  //Self.BankWalkTile := Point(4182, 2483);
+  //Self.BankColor.Colors += CTS2(3962255, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(1069672, 2, 0.07, 1.23);
+  // Port
+  //Self.BankTiles := [Point(3991, 3511)];
+  //Self.BankWalkTile := Point(3991, 3507);
+  //Self.BankColor.Colors += CTS2(5795706, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(7241094, 2, 0.07, 1.23);
+  // fally east
+  //Self.BankTiles := [Point(3858, 3031)];
+  //Self.BankWalkTile := Point(3858, 3025);
+  //Self.BankColor.Colors += CTS2(4219771, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(5665673, 2, 0.07, 1.23);
+  // WC Guild
+  Self.BankTiles := [Point(1763, 2558)];
+  Self.BankWalkTile := Point(1757, 2546);
+  Self.BankColor.Colors += CTS2(1055527, 1, 0.29, 0.97);
+  Self.BankColor.Colors +=  CTS2(1121577, 1, 0.07, 0.23);
+  Self.BankColor.Colors +=  CTS2(1450800, 1, 0.07, 0.23);
+  Self.BankColor.Colors +=  CTS2(1187370, 1, 0.07, 0.23);
+  // hosidius
+  //Self.BankTiles := [Point(2383, 2067)];
+  //Self.BankWalkTile := Point(2393, 2067);
+  //Self.BankColor.Colors += CTS2(4810357, 3, 1.29, 0.97);
+  //Self.BankColor.Colors +=  CTS2(6124672, 2, 0.07, 1.23);
+
+  Self.BankColor.Erode := 2;
+  Self.BankColor.Grow := 2;
+  Self.BankColor.ClusterDistance := 3;
+  
+  with Self.FireColor do
+  begin
+    RSObject.Colors += CTS2(16204, 2);
+    RSObject.ClusterDistance := 5;
+    RSObject.Grow := 2;
+    RSObject.Erode := 2;
+    FilterSize := 16;
+  end;
+  
+  // do login init stuff
+  if RSClient.IsLoggedIn() then
+    Self.OnLogin();
+  
+  // start the timers  
+  Self.TrueRunTime.Start();
+  Self.ReportCounter.Init(Self.ReportRate);
+  Self.DrawCounter.Init(Self.DrawRate);
+  
+  AddOnTerminate(@Self.Free);
+end;
+
+{
+  Entry point, inits and starts the bot main loop.
+}
+begin
+  Bot.Init();
+  Bot.Run();
+end.
